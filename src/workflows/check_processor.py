@@ -222,6 +222,7 @@ class CheckProcessor:
             )
             raise
         finally:
+            self._cleanup_saved_crops(check_email)
             self._cleanup_temp_file(image_path)
 
     def _extract_and_normalize_ocr_data(
@@ -266,6 +267,7 @@ class CheckProcessor:
             "memo": ocr_result.get("memo"),
             "routing_number": ocr_result.get("routing_number"),
             "account_number": ocr_result.get("account_number"),
+            "payor_address": ocr_result.get("payor_address"),
         }
 
         payor_display_name = self._extract_payor_display_name(ocr_result)
@@ -310,6 +312,7 @@ class CheckProcessor:
         fields: Dict[str, Any],
         ocr_result: Dict[str, Any],
         confidence_result: Dict[str, Any],
+        crop_image_path: Optional[str] = None,
     ) -> bool:
         """
         Check if check is a duplicate and handle accordingly.
@@ -339,6 +342,8 @@ class CheckProcessor:
         logger.warning(f"⚠️  Duplicate check detected: {fields['check_number']}")
 
         # Send duplicate notification with extracted metadata
+        attachment_source = crop_image_path or check_email["filepath"]
+
         try:
             message_id = check_email.get("email_message_id")
             from_addr = self._get_notification_from_address()
@@ -354,7 +359,7 @@ class CheckProcessor:
                 self.settings.notification_recipient,
                 check_info,
                 json_data=ocr_result,
-                attach_image=check_email["filepath"],
+                attach_image=attachment_source,
                 reply_to_message_id=message_id,
                 original_subject=check_email.get("email_subject"),
                 from_address=from_addr,
@@ -445,6 +450,7 @@ class CheckProcessor:
         original_file_path: str,
         page_num: int,
         check_index: int,
+        crop_image_path: Optional[str] = None,
     ) -> None:
         """
         Process a check that passed all validation checks.
@@ -461,6 +467,7 @@ class CheckProcessor:
             original_file_path: Path to original check file
             page_num: Page number in multi-page PDF
             check_index: Index of check in batch
+            crop_image_path: Optional path to the cropped image for attachments
         """
         email_uid = check_email["email_uid"]
 
@@ -483,8 +490,9 @@ class CheckProcessor:
         )
 
         # Attach image to SalesReceipt
+        attachment_source = crop_image_path or original_file_path
         self._attach_image_to_salesreceipt(
-            qbo_result["salesreceipt_id"], original_file_path
+            qbo_result["salesreceipt_id"], attachment_source
         )
 
         # Store in database
@@ -499,7 +507,12 @@ class CheckProcessor:
 
         # Send success notification
         self._send_success_notification(
-            check_email, fields, qbo_result, confidence_result, ocr_result
+            check_email,
+            fields,
+            qbo_result,
+            confidence_result,
+            ocr_result,
+            check_image_path=crop_image_path,
         )
 
         # Move email to processed folder (only for first check in batch)
@@ -537,6 +550,7 @@ class CheckProcessor:
             check_index: Check index on page (for multi-check pages)
         """
         email_uid = check_email["email_uid"]
+        crop_image_path: Optional[str] = None
 
         try:
             # Extract and normalize OCR data
@@ -546,9 +560,17 @@ class CheckProcessor:
 
             fields = ocr_result.get("fields", {})
 
+            crop_image_path = self._save_check_crop_image(
+                image, check_email, page_num, check_index
+            )
+
             # Check for duplicates
             if self._handle_duplicate_check(
-                check_email, fields, ocr_result, confidence_result
+                check_email,
+                fields,
+                ocr_result,
+                confidence_result,
+                crop_image_path=crop_image_path,
             ):
                 return
 
@@ -562,7 +584,11 @@ class CheckProcessor:
                     "reason": manual_review_reason,
                 }
                 self._handle_manual_review(
-                    check_email, ocr_result, confidence_result, full_extraction_json
+                    check_email,
+                    ocr_result,
+                    confidence_result,
+                    full_extraction_json,
+                    crop_image_path=crop_image_path,
                 )
                 return
 
@@ -576,6 +602,7 @@ class CheckProcessor:
                 original_file_path,
                 page_num,
                 check_index,
+                crop_image_path=crop_image_path,
             )
 
         except Exception as e:
@@ -619,6 +646,7 @@ class CheckProcessor:
                 original_subject=check_email.get("email_subject"),
                 from_address=f"check_processor@{self.settings.email_username.split('@',1)[1] if '@' in self.settings.email_username else 'phldems.org'}",
                 envelope_from=self.settings.email_username,
+                attach_image=crop_image_path or check_email.get("filepath"),
             )
             self._record_notification_message(check_email, notification_id)
 
@@ -630,6 +658,12 @@ class CheckProcessor:
         pages: list[Dict[str, Any]],
         original_file_path: str,
     ):
+        email_uid = check_email["email_uid"]
+        batch_results: list[Dict[str, Any]] = []
+        total_processed = 0
+        total_failed = 0
+        check_global_index = 0
+
         for page_num, page in enumerate(pages):
             checks = page.get("checks", [])
             if not checks:
@@ -638,82 +672,16 @@ class CheckProcessor:
             logger.info(f"Processing {len(checks)} check(s) on page {page_num}")
 
             for check_index, check_data in enumerate(checks):
+                check_image = check_data["image"]
+                logger.info(
+                    f"Processing check {check_global_index + 1}: "
+                    f"page {page_num}, index {check_index}, "
+                    f"confidence {check_data['confidence']:.1f}%"
+                )
+
                 try:
-                    check_image = check_data["image"]
-                    logger.info(
-                        f"Processing check {check_global_index + 1}: "
-                        f"page {page_num}, index {check_index}, "
-                        f"confidence {check_data['confidence']:.1f}%"
-                    )
-
-                    # Extract and normalize OCR data
-                    ocr_result, confidence_result, full_extraction_json = (
-                        self._extract_and_normalize_ocr_data(check_image)
-                    )
-                    fields = ocr_result.get("fields", {})
-
-                    # Evaluate manual review requirements first
-                    manual_review_reason = self._evaluate_manual_review_requirements(
-                        ocr_result, confidence_result, fields
-                    )
-                    if manual_review_reason:
-                        confidence_result["recommendation"] = {
-                            "action": "manual_review",
-                            "reason": manual_review_reason,
-                        }
-                        # Check for duplicates even if manual review is required
-                        if self._handle_duplicate_check(
-                            check_email, fields, ocr_result, confidence_result
-                        ):
-                            continue
-                        self._handle_manual_review(
-                            check_email,
-                            ocr_result,
-                            confidence_result,
-                            full_extraction_json,
-                        )
-                        continue
-
-                    # If not manual review, check for duplicates
-                    if self._handle_duplicate_check(
-                        check_email, fields, ocr_result, confidence_result
-                    ):
-                        continue
-
-                    # Process this individual check
-                    self._process_single_check_image(
-                        check_email,
-                        check_image,
-                        original_file_path,
-                        page_num,
-                        check_global_index,
-                    )
-
-                    batch_results.append(
-                        {
-                            "status": "success",
-                            "page": page_num,
-                            "index": check_index,
-                            "detection_confidence": check_data["confidence"],
-                        }
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Error processing check {check_global_index + 1}: {e}"
-                    )
-
-            logger.info(f"Processing {len(checks)} check(s) on page {page_num}")
-
-            for check_index, check_data in enumerate(checks):
-                try:
-                    check_image = check_data["image"]
-                    logger.info(
-                        f"Processing check {check_global_index + 1}: "
-                        f"page {page_num}, index {check_index}, "
-                        f"confidence {check_data['confidence']:.1f}%"
-                    )
-
-                    # Process this individual check
+                    # Delegate to single-check handler so duplicates/manual review
+                    # routing stays centralized.
                     self._process_single_check_image(
                         check_email,
                         check_image,
@@ -731,7 +699,6 @@ class CheckProcessor:
                         }
                     )
                     total_processed += 1
-
                 except Exception as e:
                     logger.error(f"Failed to process check {check_global_index}: {e}")
                     batch_results.append(
@@ -743,8 +710,8 @@ class CheckProcessor:
                         }
                     )
                     total_failed += 1
-
-                check_global_index += 1
+                finally:
+                    check_global_index += 1
 
         # Summary logging
         logger.info(
@@ -1015,7 +982,9 @@ class CheckProcessor:
         try:
             # Find or create customer
             customer_name = check_fields.get("customer_name") or "Unknown"
-            customer_id = self.qbo_sales.find_or_create_customer(customer_name)
+            customer_id = self.qbo_sales.find_or_create_customer(
+                customer_name, check_fields.get("payor_address")
+            )
 
             # Create sales receipt
             sales_receipt = self.qbo_sales.create_sales_receipt(
@@ -1029,6 +998,7 @@ class CheckProcessor:
                     "memo": check_fields.get("memo"),
                     "micr_line": ocr_result.get("micr_line"),
                     "doc_number": ids.get("primary_id"),
+                    "payor_address": check_fields.get("payor_address"),
                 },
                 customer_id=customer_id,
                 payment_method_id=self.settings.qbo_payment_method_id,
@@ -1109,6 +1079,7 @@ class CheckProcessor:
         ocr_result: Dict[str, Any],
         confidence_result: Dict[str, Any],
         full_extraction_json: str,
+        crop_image_path: Optional[str] = None,
     ):
         """
         Handle check that requires manual review.
@@ -1184,7 +1155,7 @@ class CheckProcessor:
                 recipient,
                 check_info,
                 reason_text,
-                check_email["filepath"],
+                crop_image_path or check_email["filepath"],
                 json_data=ocr_result,
                 reply_to_message_id=message_id,
                 original_subject=check_email.get("email_subject"),
@@ -1221,6 +1192,7 @@ class CheckProcessor:
         qbo_result: Dict[str, Any],
         confidence_result: Dict[str, Any],
         ocr_result: Dict[str, Any] = None,
+        check_image_path: Optional[str] = None,
     ):
         """Send success notification email with JSON output, threaded to original email."""
         qbo_link = self.qbo_sales.get_salesreceipt_url(qbo_result["salesreceipt_id"])
@@ -1242,6 +1214,7 @@ class CheckProcessor:
             recipient,
             check_info,
             qbo_link,
+            attach_image=check_image_path,
             json_data=json_data,
             reply_to_message_id=message_id,
             original_subject=check_email.get("email_subject"),
@@ -1472,6 +1445,52 @@ class CheckProcessor:
                 )
         except Exception as e:
             logger.warning(f"Failed to delete temporary file {file_path}: {e}")
+
+    def _cleanup_saved_crops(self, check_email: Dict[str, Any]) -> None:
+        """Delete any temporary crop images recorded on the email payload."""
+        crop_paths = check_email.pop("_crop_paths", []) or []
+        for crop_path in crop_paths:
+            self._cleanup_temp_file(crop_path)
+
+    def _save_check_crop_image(
+        self,
+        image: np.ndarray,
+        check_email: Dict[str, Any],
+        page_num: int,
+        check_index: int,
+    ) -> Optional[str]:
+        """
+        Persist cropped check image for later attachment use.
+
+        Returns:
+            Path to the saved image, or None on failure.
+        """
+        try:
+            crops_dir = Path(self.settings.image_temp_dir) / "crops"
+            crops_dir.mkdir(parents=True, exist_ok=True)
+            base_name = Path(check_email.get("filename", "check")).stem or "check"
+            timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+            filename = f"{base_name}_p{page_num + 1}_idx{check_index}_{timestamp}.png"
+            output_path = crops_dir / filename
+            success = cv2.imwrite(str(output_path), image)
+            if not success:
+                logger.warning(
+                    "Failed to save cropped image for page %s index %s",
+                    page_num,
+                    check_index,
+                )
+                return None
+            crop_paths = check_email.setdefault("_crop_paths", [])
+            crop_paths.append(str(output_path))
+            logger.debug("Saved cropped check image to %s", output_path)
+            return str(output_path)
+        except Exception:
+            logger.exception(
+                "Unexpected error while saving cropped image for page %s index %s",
+                page_num,
+                check_index,
+            )
+            return None
 
     def _load_all_pages(self, file_path: str) -> list[Dict[str, Any]]:
         """

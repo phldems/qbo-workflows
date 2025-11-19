@@ -84,6 +84,10 @@ class QuickBooksSalesReceipt:
             "PrivateNote": self._build_private_note(check_data),
         }
 
+        bill_addr = self._build_bill_address(check_data.get("payor_address"))
+        if bill_addr:
+            sales_receipt["BillAddr"] = bill_addr
+
         logger.info(
             f"Creating SalesReceipt for check #{check_data.get('check_number')}"
         )
@@ -196,7 +200,9 @@ class QuickBooksSalesReceipt:
                 logger.error(f"Response: {e.response.text}")
             raise
 
-    def find_or_create_customer(self, customer_name: str) -> str:
+    def find_or_create_customer(
+        self, customer_name: str, address: Optional[Dict[str, Any]] = None
+    ) -> str:
         """
         Find existing customer by name or create new one.
 
@@ -236,13 +242,15 @@ class QuickBooksSalesReceipt:
 
             # Create new customer
             logger.info(f"Creating new customer: {customer_name}")
-            return self._create_customer(customer_name)
+            return self._create_customer(customer_name, address)
 
         except Exception as e:
             logger.error(f"Error finding/creating customer: {e}")
             raise
 
-    def _create_customer(self, customer_name: str) -> str:
+    def _create_customer(
+        self, customer_name: str, address: Optional[Dict[str, Any]] = None
+    ) -> str:
         """Create a new customer."""
         realm_id = self.auth.get_realm_id()
         access_token = self.auth.get_valid_access_token()
@@ -267,6 +275,10 @@ class QuickBooksSalesReceipt:
             "GivenName": given_name,
             "FamilyName": family_name,
         }
+
+        bill_addr = self._build_bill_address(address)
+        if bill_addr:
+            customer_data["BillAddr"] = bill_addr
 
         response = requests.post(
             url, headers=headers, params=params, json=customer_data, timeout=30
@@ -335,6 +347,35 @@ class QuickBooksSalesReceipt:
             parts.append(f"MICR: {check_data['micr_line']}")
 
         return "\n".join(parts) if parts else ""
+
+    def _build_bill_address(
+        self, payor_address: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Convert OCR payor address structure into the QBO BillAddr schema.
+        """
+        if not payor_address or not isinstance(payor_address, dict):
+            return None
+
+        street = payor_address.get("street")
+        city = payor_address.get("city")
+        state = payor_address.get("state")
+        postal_code = payor_address.get("zip")
+        country = payor_address.get("country")
+
+        bill_addr: Dict[str, Any] = {}
+        if street:
+            bill_addr["Line1"] = street
+        if city:
+            bill_addr["City"] = city
+        if state:
+            bill_addr["CountrySubDivisionCode"] = state
+        if postal_code:
+            bill_addr["PostalCode"] = postal_code
+        if country:
+            bill_addr["Country"] = country
+
+        return bill_addr or None
 
     def _convert_date_format(self, date_str: Optional[str]) -> str:
         """

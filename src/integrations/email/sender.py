@@ -229,6 +229,7 @@ class EmailSender:
         from_address: Optional[str] = None,
         envelope_from: Optional[str] = None,
         original_subject: Optional[str] = None,
+        attach_image: Optional[str] = None,
     ) -> Optional[str]:
         """Send notification when processing fails."""
 
@@ -285,7 +286,7 @@ class EmailSender:
             subject,
             text,
             html,
-            attachment_path=None,
+            attachment_path=attach_image,
             reply_to_message_id=reply_to_message_id,
             from_address=from_address,
             envelope_from=envelope_from,
