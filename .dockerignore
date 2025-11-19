@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+.pytest_cache
+.python-version
+.DS_Store
+__pycache__/
+data/
+logs/
+.env
+*.pdf

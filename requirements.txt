@@ -1,0 +1,31 @@
+# Core
+python-dotenv==1.0.0
+loguru==0.7.2
+
+# OCR and Image Processing
+opencv-python==4.10.0.84
+numpy==1.26.4
+Pillow==10.3.0
+PyMuPDF==1.24.0
+
+# Google Cloud Vertex AI
+google-cloud-aiplatform==1.70.0
+google-genai==1.50.1
+
+# Email
+imap-tools==1.7.1
+
+# QuickBooks Online
+intuit-oauth==1.2.4
+requests==2.31.0
+requests-toolbelt==1.0.0
+
+# Utilities
+python-dateutil==2.8.2
+pydantic==2.12.4
+pydantic-settings==2.5.2
+
+# Testing
+pytest==8.3.0
+pytest-cov==5.0.0
+pytest-mock==3.14.0
